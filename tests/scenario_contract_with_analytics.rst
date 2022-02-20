@@ -18,7 +18,7 @@ Imports::
 
 Install contract::
 
-    >>> config = activate_modules(['analytic_invoice', 'contract'])
+    >>> config = activate_modules(['analytic_account', 'analytic_invoice', 'contract', 'activity'])
 
 Create company::
 

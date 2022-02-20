@@ -1,0 +1,8 @@
+# Install development requirements
+
+git+https://github.com/NaN-tic/trytond-activity.git@6.0
+tox
+coverage
+flake8
+
+-r requirements.txt

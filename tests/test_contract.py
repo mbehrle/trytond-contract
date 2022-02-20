@@ -11,6 +11,7 @@ from trytond.modules.company.tests import CompanyTestMixin
 class TestContractCase(CompanyTestMixin, ModuleTestCase):
     'Test Contract module'
     module = 'contract'
+    extras = ['activity']
 
 
 def suite():

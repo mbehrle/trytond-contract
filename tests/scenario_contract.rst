@@ -21,7 +21,7 @@ Imports::
 
 Install contract::
 
-    >>> config = activate_modules('contract')
+    >>> config = activate_modules(['contract', 'activity'])
 
 Create company::
 

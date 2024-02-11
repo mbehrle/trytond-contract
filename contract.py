@@ -20,6 +20,7 @@ from trytond.wizard import Wizard, StateView, StateAction, Button
 from trytond.modules.product import price_digits
 from trytond.i18n import gettext
 from trytond.exceptions import UserError
+from trytond.modules.product import round_price
 
 try:
     from trytond.modules.analytic_account import AnalyticMixin
@@ -367,6 +368,8 @@ class Contract(RRuleMixin, Workflow, ModelSQL, ModelView):
         Consumption = Pool().get('contract.consumption')
         consumptions = Consumption.search([
                 ('contract', 'in', [x.id for x in contracts]),
+                ('contract_line.contract.company', '=',
+                    Transaction().context.get('company')),
                 ])
         if consumptions:
             raise UserError(gettext('contract.cannot_draft',
@@ -543,11 +546,11 @@ class ContractLine(sequence_ordered(), ModelSQL, ModelView):
         searcher='search_contract_state')
     service = fields.Many2One('contract.service', 'Service', required=True,
         states={
-            'readonly': Bool(Eval('consumptions', [-1])),
-        }, depends=['consumptions'])
+            'readonly': Bool(Eval('has_consumptions')),
+        }, depends=['has_consumptions'])
     start_date = fields.Date('Start Date',
         states={
-            'readonly': Bool(Eval('consumptions', [-1])),
+            'readonly': Bool(Eval('has_consumptions')),
             'required': Eval('contract_state') == 'confirmed',
             },
         domain=[
@@ -555,7 +558,7 @@ class ContractLine(sequence_ordered(), ModelSQL, ModelView):
                 ('start_date', '<=', Eval('end_date', None)),
                 ()),
             ],
-        depends=['end_date', 'contract_state', 'consumptions'])
+        depends=['end_date', 'contract_state', 'has_consumptions'])
     end_date = fields.Date('End Date',
         states={
             'required': Eval('contract_state') == 'finished',
@@ -577,6 +580,8 @@ class ContractLine(sequence_ordered(), ModelSQL, ModelView):
             searcher='search_last_consumption_dates')
     consumptions = fields.One2Many('contract.consumption', 'contract_line',
         'Consumptions', readonly=True)
+    has_consumptions = fields.Function(fields.Boolean("Has Consumptions"),
+        'get_has_consumptions')
 
     @classmethod
     def __setup__(cls):
@@ -694,6 +699,13 @@ class ContractLine(sequence_ordered(), ModelSQL, ModelView):
         return consumption
 
     @classmethod
+    def get_has_consumptions(cls, lines, name):
+        res = dict((x.id, False) for x in lines)
+        for line in lines:
+            res[line.id] = True if line.consumptions else False
+        return res
+
+    @classmethod
     def delete(cls, lines):
         for line in lines:
             if line.consumptions:
@@ -786,12 +798,6 @@ class ContractConsumption(ModelSQL, ModelView):
     def search_contract(cls, name, clause):
         return [('contract_line.contract',) + tuple(clause[1:])]
 
-    def _get_tax_rule_pattern(self):
-        '''
-        Get tax rule pattern
-        '''
-        return {}
-
     def _get_start_end_date(self):
         pool = Pool()
         Lang = pool.get('ir.lang')
@@ -807,26 +813,37 @@ class ContractConsumption(ModelSQL, ModelView):
         pool = Pool()
         InvoiceLine = pool.get('account.invoice.line')
         AccountConfiguration = pool.get('account.configuration')
-        Module = pool.get('ir.module')
-        analytic_invoice_installed = Module.search([
-              ('name', '=', 'analytic_invoice'),
-              ('state', '=', 'activated'),
-                ], limit=1)
-        if analytic_invoice_installed:
+
+        try:
             AnalyticAccountEntry = pool.get('analytic.account.entry')
+        except KeyError:
+            AnalyticAccountEntry = None
+
         account_config = AccountConfiguration(1)
         if (self.invoice_lines and
                 not Transaction().context.get('force_reinvoice', False)):
             return
+
         invoice_line = InvoiceLine()
+        invoice_line.invoice_type = 'out'
         invoice_line.type = 'line'
         invoice_line.origin = self
         invoice_line.company = self.contract_line.contract.company
         invoice_line.currency = self.contract_line.contract.currency
         invoice_line.sequence = self.contract_line.sequence
+        invoice_line.party = self.contract_line.contract.party
+
         invoice_line.product = None
         if self.contract_line.service:
             invoice_line.product = self.contract_line.service.product
+            invoice_line.on_change_product()
+
+            if not invoice_line.account:
+                raise UserError(gettext(
+                    'contract.missing_account_revenue',
+                        contract_line=self.contract_line.rec_name,
+                        product=invoice_line.product.rec_name))
+
         start_date, end_date = self._get_start_end_date()
         invoice_line.description = '[%(start)s - %(end)s] %(name)s' % {
             'start': start_date,
@@ -845,35 +862,14 @@ class ContractConsumption(ModelSQL, ModelView):
                     - self.start_date).total_seconds() /
                 (self.end_period_date + datetime.timedelta(days=1) -
                     self.init_period_date).total_seconds())
-        unit_price = self.contract_line.unit_price * rate
-        digits = invoice_line.__class__.unit_price.digits
-        unit_price = unit_price.quantize(Decimal(str(10 ** -digits[1])))
-        invoice_line.unit_price = unit_price
-        invoice_line.party = self.contract_line.contract.party
-        taxes = []
+
         if invoice_line.product:
-            invoice_line.unit = invoice_line.product.default_uom
-            party = invoice_line.party
-            pattern = self._get_tax_rule_pattern()
-            for tax in invoice_line.product.customer_taxes_used:
-                if party.customer_tax_rule:
-                    tax_ids = party.customer_tax_rule.apply(tax, pattern)
-                    if tax_ids:
-                        taxes.extend(tax_ids)
-                    continue
-                taxes.append(tax.id)
-            if party.customer_tax_rule:
-                tax_ids = party.customer_tax_rule.apply(None, pattern)
-                if tax_ids:
-                    taxes.extend(tax_ids)
-            invoice_line.account = invoice_line.product.account_revenue_used
             if not invoice_line.account:
                 raise UserError(gettext(
                     'contract.missing_account_revenue',
                         contract_line=self.contract_line.rec_name,
                         product=invoice_line.product.rec_name))
         else:
-            invoice_line.unit = None
             for name in ['default_product_account_revenue',
                     'default_category_account_revenue']:
                 invoice_line.account = account_config.get_multivalue(name)
@@ -884,9 +880,9 @@ class ContractConsumption(ModelSQL, ModelView):
                     'contract.missing_account_revenue_property',
                         contract_line=self.contract_line.rec_name))
 
-        invoice_line.taxes = taxes
-        invoice_line.invoice_type = 'out'
-        if analytic_invoice_installed:
+        invoice_line.unit_price = round_price(self.contract_line.unit_price * rate)
+
+        if AnalyticAccountEntry:
             invoice_line.analytic_accounts = AnalyticAccountEntry.copy(
                 self.contract_line.analytic_accounts, default={
                     'origin': invoice_line.id})
@@ -894,9 +890,11 @@ class ContractConsumption(ModelSQL, ModelView):
         return invoice_line
 
     def get_amount_to_invoice(self):
-        Uom = Pool().get('product.uom')
+        pool = Pool()
+        Uom = pool.get('product.uom')
+        ModelData = pool.get('ir.model.data')
 
-        uom, = Uom.search([('name', '=', 'Unit')])
+        uom = Uom(ModelData.get_id('product', 'uom_unit'))
 
         quantity = ((self.end_date - self.start_date).total_seconds() /
             (self.end_period_date - self.init_period_date).total_seconds())
@@ -954,7 +952,8 @@ class ContractConsumption(ModelSQL, ModelView):
         invoice.on_change_party()
         invoice.journal = journal
         invoice.payment_term = values['payment_term']
-        invoice.account = invoice.on_change_with_account()
+        invoice._update_account()
+
         if values.get('contract'):
             contract = values['contract']
             invoice.reference = contract.reference
@@ -1054,8 +1053,10 @@ class CreateConsumptions(Wizard):
     def do_create_consumptions(self, action):
         pool = Pool()
         Contract = pool.get('contract')
+
         contracts = Contract.search([
                 ('state', 'in', ['confirmed', 'finished']),
+                ('company', '=', Transaction().context.get('company')),
                 ])
         consumptions = Contract.consume(contracts, self.start.date)
         data = {'res_id': [c.id for c in consumptions]}
@@ -1169,6 +1170,7 @@ class ContractReview(Workflow, ModelSQL, ModelView):
 
         contracts = Contract.search([
                     ('state', 'in', ['confirmed', 'done']),
+                    ('company', '=', Transaction().context.get('company')),
                     ['OR',
                         [
                             ('end_date', '=', None),
